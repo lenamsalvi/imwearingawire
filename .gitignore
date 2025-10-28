@@ -1,0 +1,28 @@
+# ESP-IDF
+build/
+sdkconfig
+sdkconfig.old
+*.pyc
+.vscode/
+.idea/
+
+# Arduino
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+# Temporary files
+tmp/
+temp/
