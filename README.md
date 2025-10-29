@@ -60,8 +60,8 @@ A self-reflection audio recording device built on ESP32. Records voice memos to 
 - [x] Assemble hardware components
 - [x] Format SD card (FAT32, MBR)
 - [x] Wire buttons with pull-down resistors
-- [ ] Install ESP-IDF development environment (Windows)
-- [ ] Test basic ESP32 connectivity and upload test sketch
+- [x] Install ESP-IDF development environment (Windows)
+- [x] Test basic ESP32 connectivity and upload test sketch
 
 ### Phase 2: Component Testing
 - [ ] Wire and test OLED display (I2C communication)
@@ -125,6 +125,14 @@ A self-reflection audio recording device built on ESP32. Records voice memos to 
 - ICS-43434 chosen for superior I2S quality over analog MAX4466
 - ESP-IDF required for full HFP Bluetooth stack (Arduino libraries insufficient)
 - Will test individual components before integration
+
+  **Phase 1 Completed**: 2025-10-29
+
+  - ESP-IDF v5.5.1 installed to `C:\esp\` (custom path to avoid spaces in Windows username)
+  - CP2102 USB-to-UART drivers required manual installation from Silicon Labs
+  - ESP32 board confirmed working on COM3
+  - Project location: `C:\esp\projects\imwearingawire\` (avoiding user folder path issues)
+  - Blink test successful - toolchain verified working
 
 ## Resources
 
