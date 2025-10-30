@@ -44,15 +44,16 @@ A self-reflection audio recording device built on ESP32. Records voice memos to 
 - GND: GND
 
 ### OLED Display (I2C)
-- SDA: GPIO ___
-- SCL: GPIO ___
+- SDA: GPIO 21
+- SCL: GPIO 22
 - VCC: 3.3V
 - GND: GND
+- Address: 0 x 3D
 
 ### Buttons
-- Button 1 (Record/Stop): GPIO ___
-- Button 2 (Play/Pause): GPIO ___
-- Button 3 (Menu/Select): GPIO ___
+- Button 1 (Previous): GPIO 34
+- Button 2 (Next): GPIO 32
+- Button 3 (Select): GPIO 33
 
 ## Development Roadmap
 
@@ -64,7 +65,7 @@ A self-reflection audio recording device built on ESP32. Records voice memos to 
 - [x] Test basic ESP32 connectivity and upload test sketch
 
 ### Phase 2: Component Testing
-- [ ] Wire and test OLED display (I2C communication)
+- [x] Wire and test OLED display (I2C communication)
 - [ ] Wire and test SD card (FAT32 read/write operations)
 - [ ] Wire and test ICS-43434 microphone (I2S audio capture)
 - [ ] Test button inputs (debouncing and event handling)
@@ -140,13 +141,17 @@ A self-reflection audio recording device built on ESP32. Records voice memos to 
 - [ICS-43434 Datasheet](https://www.invensense.com/products/digital/ics-43434/)
 - [Bluetooth A2DP Specification](https://www.bluetooth.com/specifications/specs/a2dp-1-3-2/)
 - [Bluetooth HFP Specification](https://www.bluetooth.com/specifications/specs/hands-free-profile-1-8/)
+- [Inland Pin Map](https://community.microcenter.com/kb/articles/652-inland-esp32-core-board-black-and-eco-friendly)
 
 ## Project Structure
 
 ```
 imwearingawire/
-├── src/              # Source code
-├── docs/             # Additional documentation
-├── schematics/       # Circuit diagrams and layouts
-└── README.md         # This file
+├── main/                    # ESP-IDF main component (source code)
+│   ├── oled_test.c         # Current: Button + OLED navigation test
+│   ├── CMakeLists.txt      # Component build configuration
+│   └── idf_component.yml   # Component dependencies (ssd1306 driver)
+├── build/                   # Build output (generated, not in git)
+├── CMakeLists.txt          # Root project configuration
+└── README.md               # This file
 ```

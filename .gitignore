@@ -26,3 +26,14 @@ Thumbs.db
 # Temporary files
 tmp/
 temp/
+
+# Build output
+build/
+
+# Component dependencies (downloaded by component manager)
+dependencies/
+managed_components/
+
+# SDK configuration
+sdkconfig
+sdkconfig.old
