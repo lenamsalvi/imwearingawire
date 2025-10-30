@@ -66,9 +66,9 @@ A self-reflection audio recording device built on ESP32. Records voice memos to 
 
 ### Phase 2: Component Testing
 - [x] Wire and test OLED display (I2C communication)
-- [ ] Wire and test SD card (FAT32 read/write operations)
+- [x] Wire and test SD card (FAT32 read/write operations)
 - [ ] Wire and test ICS-43434 microphone (I2S audio capture)
-- [ ] Test button inputs (debouncing and event handling)
+- [x] Test button inputs (debouncing and event handling)
 
 ### Phase 3: Core Functionality
 - [ ] Implement WAV file recording (I2S mic → SD card)

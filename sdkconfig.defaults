@@ -1,0 +1,8 @@
+# Memory Configuration for I'm Wearing a Wire
+#
+# Main Task Stack Size:
+# - SD card mount (FAT filesystem): ~3900 bytes peak usage
+# - Recording loop (I2S buffer): ~2668 bytes peak usage
+# - Screen drawing: ~900 bytes peak usage
+# Setting to 6144 bytes (6KB) provides 2244 bytes safety margin (36%)
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
