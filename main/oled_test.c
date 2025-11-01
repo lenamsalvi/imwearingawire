@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <sys/unistd.h>
 #include <sys/stat.h>
+#include <dirent.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -56,16 +57,15 @@
 // WAV file configuration
 #define WAV_HEADER_SIZE             44
 #define MAX_FILENAME_LEN            64
+#define MAX_FILES_IN_LIST           20
 
 // Screen states
-#define NUM_SCREENS                 6
+#define NUM_SCREENS                 4
 typedef enum {
-    SCREEN_TITLE = 0,
-    SCREEN_SD_TEST,
-    SCREEN_RECORD,
+    SCREEN_RECORD = 0,
     SCREEN_PLAYBACK,
-    SCREEN_SETTINGS,
-    SCREEN_GRAPHICS
+    SCREEN_BLUETOOTH,
+    SCREEN_SYSTEM
 } screen_state_t;
 
 // WAV header structure
@@ -86,18 +86,128 @@ typedef struct {
 } __attribute__((packed)) wav_header_t;
 
 // Global state
-static screen_state_t current_screen = SCREEN_TITLE;
-static bool invert_mode = false;
-static char sd_test_result[64] = "Not tested";
+static screen_state_t current_screen = SCREEN_RECORD;
 static bool sd_initialized = false;
 static uint32_t last_button_time = 0;
+
+// Recording state
 static i2s_chan_handle_t rx_handle = NULL;
 static bool is_recording = false;
 static FILE *recording_file = NULL;
 static uint32_t recorded_samples = 0;
-static int16_t audio_level = 0;
 static uint32_t recording_counter = 1;
 static char current_filename[MAX_FILENAME_LEN];
+static uint32_t recording_start_time = 0;  // For elapsed time
+
+// Playback state
+static bool playback_browse_mode = false;
+static char file_list[MAX_FILES_IN_LIST][MAX_FILENAME_LEN];
+static int file_count = 0;
+static int selected_file_index = 0;  // 0 = "Back", 1+ = actual files
+static int scroll_offset = 0;  // Which item is at top of visible window
+
+// System info
+static uint64_t sd_total_bytes = 0;
+static uint64_t sd_free_bytes = 0;
+
+// Forward declarations
+static void scan_sd_files(void);
+static void get_sd_card_info(void);
+static void draw_button_labels(ssd1306_handle_t dev, const char *left, const char *middle, const char *right);
+
+// Scan SD card for WAV files and update file list
+static void scan_sd_files(void)
+{
+    file_count = 0;
+    int max_memo_num = 0;
+
+    if (!sd_initialized) {
+        return;
+    }
+
+    DIR *dir = opendir(MOUNT_POINT);
+    if (dir == NULL) {
+        ESP_LOGE(TAG, "Failed to open directory");
+        return;
+    }
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL && file_count < MAX_FILES_IN_LIST) {
+        // Only include .wav files
+        if (strstr(entry->d_name, ".wav") != NULL || strstr(entry->d_name, ".WAV") != NULL) {
+            strncpy(file_list[file_count], entry->d_name, MAX_FILENAME_LEN - 1);
+            file_list[file_count][MAX_FILENAME_LEN - 1] = '\0';
+            file_count++;
+
+            // Check if it's a memo_XXX.wav file to find highest number
+            int num;
+            if (sscanf(entry->d_name, "MEMO_%d.WAV", &num) == 1) {
+                if (num > max_memo_num) {
+                    max_memo_num = num;
+                }
+            }
+        }
+    }
+    closedir(dir);
+
+    // Set recording counter to next available number
+    recording_counter = max_memo_num + 1;
+
+    ESP_LOGI(TAG, "Found %d WAV files, next recording: memo_%03lu.wav", file_count, recording_counter);
+}
+
+// Get SD card size and free space
+static void get_sd_card_info(void)
+{
+    if (!sd_initialized) {
+        return;
+    }
+
+    FATFS *fs;
+    DWORD fre_clust;
+
+    if (f_getfree("0:", &fre_clust, &fs) == FR_OK) {
+        uint64_t total_sectors = (fs->n_fatent - 2) * fs->csize;
+        uint64_t free_sectors = fre_clust * fs->csize;
+
+        sd_total_bytes = total_sectors * CONFIG_WL_SECTOR_SIZE;
+        sd_free_bytes = free_sectors * CONFIG_WL_SECTOR_SIZE;
+    }
+}
+
+// Draw button labels at bottom of screen
+static void draw_button_labels(ssd1306_handle_t dev, const char *left, const char *middle, const char *right)
+{
+    const int y_pos = 52;  // Bottom of screen (64 - 12)
+
+    // Left button
+    if (left && strlen(left) > 0) {
+        char label[16];
+        snprintf(label, sizeof(label), "[%s]", left);
+        ssd1306_draw_string(dev, 0, y_pos, (const uint8_t *)label, 12, 1);
+    } else {
+        ssd1306_draw_string(dev, 0, y_pos, (const uint8_t *)"[]", 12, 1);
+    }
+
+    // Middle button
+    int middle_x = 40;  // Approximate center
+    if (middle && strlen(middle) > 0) {
+        char label[16];
+        snprintf(label, sizeof(label), "[%s]", middle);
+        ssd1306_draw_string(dev, middle_x, y_pos, (const uint8_t *)label, 12, 1);
+    } else {
+        ssd1306_draw_string(dev, middle_x, y_pos, (const uint8_t *)"[]", 12, 1);
+    }
+
+    // Right button
+    if (right && strlen(right) > 0) {
+        char label[16];
+        snprintf(label, sizeof(label), "[%s]", right);
+        ssd1306_draw_string(dev, 104, y_pos, (const uint8_t *)label, 12, 1);
+    } else {
+        ssd1306_draw_string(dev, 104, y_pos, (const uint8_t *)"[]", 12, 1);
+    }
+}
 
 static esp_err_t i2c_master_init(void)
 {
@@ -253,7 +363,6 @@ static void start_recording(void)
 
     if (!sd_initialized) {
         ESP_LOGW(TAG, "Cannot record - SD card not mounted");
-        snprintf(sd_test_result, sizeof(sd_test_result), "SD card error");
         return;
     }
 
@@ -263,7 +372,6 @@ static void start_recording(void)
         esp_err_t ret = i2s_init();
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "I2S init failed: %s", esp_err_to_name(ret));
-            snprintf(sd_test_result, sizeof(sd_test_result), "Mic init failed");
             return;
         }
     }
@@ -272,19 +380,16 @@ static void start_recording(void)
     esp_err_t ret = i2s_channel_enable(rx_handle);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to enable I2S: %s", esp_err_to_name(ret));
-        snprintf(sd_test_result, sizeof(sd_test_result), "I2S enable failed");
         return;
     }
 
     // Generate unique filename
     snprintf(current_filename, sizeof(current_filename),
-             MOUNT_POINT "/memo_%03lu.wav", recording_counter);
-    recording_counter++;
+             MOUNT_POINT "/MEMO_%03lu.WAV", recording_counter);
 
     recording_file = fopen(current_filename, "wb");
     if (recording_file == NULL) {
         ESP_LOGE(TAG, "Failed to open recording file");
-        snprintf(sd_test_result, sizeof(sd_test_result), "File open failed");
         return;
     }
 
@@ -293,13 +398,12 @@ static void start_recording(void)
         ESP_LOGE(TAG, "Failed to write WAV header");
         fclose(recording_file);
         recording_file = NULL;
-        snprintf(sd_test_result, sizeof(sd_test_result), "Header write failed");
         return;
     }
 
     is_recording = true;
     recorded_samples = 0;
-    audio_level = 0;
+    recording_start_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
     ESP_LOGI(TAG, "Recording started");
 }
 
@@ -328,122 +432,177 @@ static void stop_recording(void)
     ESP_LOGI(TAG, "Recording stopped. %lu samples recorded to %s", recorded_samples, current_filename);
 }
 
-static void draw_screen_title(ssd1306_handle_t dev)
-{
-    ssd1306_clear_screen(dev, 0x00);
-    ssd1306_draw_string(dev, 10, 16, (const uint8_t *)"I'm Wearing", 16, 1);
-    ssd1306_draw_string(dev, 20, 40, (const uint8_t *)"a Wire", 16, 1);
-}
-
-static void draw_screen_sd_test(ssd1306_handle_t dev)
-{
-    ssd1306_clear_screen(dev, 0x00);
-    ssd1306_draw_string(dev, 10, 8, (const uint8_t *)"SD CARD STATUS", 12, 1);
-
-    if (sd_initialized) {
-        ssd1306_draw_string(dev, 25, 32, (const uint8_t *)"MOUNTED", 16, 1);
-        ssd1306_draw_string(dev, 35, 50, (const uint8_t *)"Ready", 8, 1);
-    } else {
-        ssd1306_draw_string(dev, 10, 32, (const uint8_t *)"NOT MOUNTED", 12, 1);
-        if (strlen(sd_test_result) > 0) {
-            ssd1306_draw_string(dev, 5, 50, (const uint8_t *)sd_test_result, 8, 1);
-        }
-    }
-}
-
+// Screen 1: RECORD
 static void draw_screen_record(ssd1306_handle_t dev)
 {
     ssd1306_clear_screen(dev, 0x00);
 
     if (is_recording) {
-        ssd1306_draw_string(dev, 15, 8, (const uint8_t *)"RECORDING", 16, 1);
+        // Title
+        ssd1306_draw_string(dev, 5, 0, (const uint8_t *)"RECORDING...", 12, 1);
 
-        // Show sample count
-        char samples_str[32];
-        snprintf(samples_str, sizeof(samples_str), "Samples: %lu", recorded_samples);
-        ssd1306_draw_string(dev, 5, 28, (const uint8_t *)samples_str, 8, 1);
+        // Elapsed time
+        uint32_t elapsed_ms = (xTaskGetTickCount() * portTICK_PERIOD_MS) - recording_start_time;
+        uint32_t elapsed_sec = elapsed_ms / 1000;
+        char time_str[16];
+        snprintf(time_str, sizeof(time_str), "  %02lu:%02lu", elapsed_sec / 60, elapsed_sec % 60);
+        ssd1306_draw_string(dev, 25, 16, (const uint8_t *)time_str, 16, 1);
 
-        // Draw audio level meter (bar)
-        int bar_width = (audio_level * 100) / 32768;  // Scale to 0-100
-        if (bar_width > 100) bar_width = 100;
-        ssd1306_draw_string(dev, 5, 42, (const uint8_t *)"Level:", 8, 1);
-        // Draw bar from y=52 to y=60
-        for (int x = 0; x < bar_width; x++) {
-            ssd1306_draw_line(dev, 5 + x, 52, 5 + x, 60);
-        }
+        // Current filename
+        ssd1306_draw_string(dev, 5, 36, (const uint8_t *)current_filename + strlen(MOUNT_POINT) + 1, 12, 1);
+
+        // Button labels
+        draw_button_labels(dev, "<", "STOP", ">");
     } else {
-        ssd1306_draw_string(dev, 5, 8, (const uint8_t *)"RECORD READY", 16, 1);
-        ssd1306_draw_string(dev, 10, 35, (const uint8_t *)"Press middle", 12, 1);
-        ssd1306_draw_string(dev, 10, 50, (const uint8_t *)"to start", 12, 1);
+        // Title
+        ssd1306_draw_string(dev, 5, 0, (const uint8_t *)"RECORD MEMO", 12, 1);
+
+        // Instructions
+        ssd1306_draw_string(dev, 5, 16, (const uint8_t *)"Ready", 12, 1);
+
+        // Next filename
+        char next_file[32];
+        snprintf(next_file, sizeof(next_file), "Next: MEMO_%03lu.WAV", recording_counter);
+        ssd1306_draw_string(dev, 5, 28, (const uint8_t *)next_file, 12, 1);
+
+        // Button labels
+        draw_button_labels(dev, "<", "REC", ">");
     }
 }
 
+// Screen 2: PLAYBACK (with two modes)
 static void draw_screen_playback(ssd1306_handle_t dev)
 {
     ssd1306_clear_screen(dev, 0x00);
-    ssd1306_draw_string(dev, 20, 8, (const uint8_t *)"PLAYBACK", 16, 1);
-    ssd1306_draw_string(dev, 5, 32, (const uint8_t *)"memo_001.wav", 12, 1);
-    ssd1306_draw_string(dev, 5, 48, (const uint8_t *)"memo_002.wav", 12, 1);
-}
 
-static void draw_screen_settings(ssd1306_handle_t dev)
-{
-    ssd1306_clear_screen(dev, 0x00);
-    ssd1306_draw_string(dev, 25, 8, (const uint8_t *)"SETTINGS", 16, 1);
-    ssd1306_draw_string(dev, 5, 30, (const uint8_t *)"> Sample Rate", 12, 1);
-    ssd1306_draw_string(dev, 5, 44, (const uint8_t *)"  Bluetooth", 12, 1);
-}
+    if (!playback_browse_mode) {
+        // Mode 1: Screen navigation
+        char title[24];
+        snprintf(title, sizeof(title), ">FILES (%d)", file_count);
+        ssd1306_draw_string(dev, 5, 0, (const uint8_t *)title, 12, 1);
 
-static void draw_screen_graphics(ssd1306_handle_t dev)
-{
-    ssd1306_clear_screen(dev, 0x00);
-    ssd1306_draw_string(dev, 20, 2, (const uint8_t *)"GRAPHICS", 12, 1);
-
-    // Draw test rectangles
-    for (int i = 0; i < 3; i++) {
-        int y = 18 + (i * 14);
-        ssd1306_draw_line(dev, 10, y, 50, y);
-        ssd1306_draw_line(dev, 10, y + 10, 50, y + 10);
-        ssd1306_draw_line(dev, 10, y, 10, y + 10);
-        ssd1306_draw_line(dev, 50, y, 50, y + 10);
-    }
-
-    // Draw audio level bars
-    for (int i = 0; i < 5; i++) {
-        int height = 10 + (i * 8);
-        int x = 60 + (i * 12);
-        for (int dx = 0; dx < 8; dx++) {
-            ssd1306_draw_line(dev, x + dx, 60 - height, x + dx, 60);
+        // Show up to 3 files (no cursor) - tight spacing
+        for (int i = 0; i < 3 && i < file_count; i++) {
+            ssd1306_draw_string(dev, 5, 14 + (i * 12), (const uint8_t *)file_list[i], 12, 1);
         }
+
+        // Button labels
+        if (file_count > 0) {
+            draw_button_labels(dev, "<", "Select", ">");
+        } else {
+            draw_button_labels(dev, "<", "", ">");
+        }
+    } else {
+        // Mode 2: List browsing with scrolling
+        char title[24];
+        snprintf(title, sizeof(title), "FILES (%d)", file_count);
+        ssd1306_draw_string(dev, 5, 0, (const uint8_t *)title, 12, 1);
+
+        // Show 3 items starting from scroll_offset
+        // Items: 0="Back", 1=file_list[0], 2=file_list[1], etc.
+        int total_items = file_count + 1;  // +1 for "Back"
+
+        for (int i = 0; i < 3; i++) {
+            int item_index = scroll_offset + i;
+            if (item_index >= total_items) break;  // No more items
+
+            int y_pos = 14 + (i * 12);
+            bool is_selected = (item_index == selected_file_index);
+
+            if (item_index == 0) {
+                // "Back" item
+                if (is_selected) {
+                    ssd1306_draw_string(dev, 5, y_pos, (const uint8_t *)">Back", 12, 1);
+                } else {
+                    ssd1306_draw_string(dev, 8, y_pos, (const uint8_t *)"Back", 12, 1);
+                }
+            } else {
+                // File item
+                int file_idx = item_index - 1;  // Convert to file_list index
+                if (is_selected) {
+                    char cursor_line[MAX_FILENAME_LEN + 2];
+                    snprintf(cursor_line, sizeof(cursor_line), ">%s", file_list[file_idx]);
+                    ssd1306_draw_string(dev, 5, y_pos, (const uint8_t *)cursor_line, 12, 1);
+                } else {
+                    ssd1306_draw_string(dev, 8, y_pos, (const uint8_t *)file_list[file_idx], 12, 1);
+                }
+            }
+        }
+
+        // Button labels
+        draw_button_labels(dev, "v", "Play", "^");
     }
+}
+
+// Screen 3: BLUETOOTH (placeholder for Phase 4)
+static void draw_screen_bluetooth(ssd1306_handle_t dev)
+{
+    ssd1306_clear_screen(dev, 0x00);
+
+    // Title
+    ssd1306_draw_string(dev, 10, 0, (const uint8_t *)"BLUETOOTH", 12, 1);
+
+    // Status
+    ssd1306_draw_string(dev, 5, 16, (const uint8_t *)"Not paired", 12, 1);
+
+    // Note
+    ssd1306_draw_string(dev, 5, 28, (const uint8_t *)"(Phase 4)", 12, 1);
+
+    // Button labels
+    draw_button_labels(dev, "<", "PAIR", ">");
+}
+
+// Screen 4: SYSTEM
+static void draw_screen_system(ssd1306_handle_t dev)
+{
+    ssd1306_clear_screen(dev, 0x00);
+
+    // Title
+    ssd1306_draw_string(dev, 5, 0, (const uint8_t *)"SYSTEM INFO", 12, 1);
+
+    // SD card status
+    if (sd_initialized) {
+        char sd_status[32];
+        snprintf(sd_status, sizeof(sd_status), "SD: OK");
+        ssd1306_draw_string(dev, 5, 14, (const uint8_t *)sd_status, 12, 1);
+
+        char files_str[32];
+        snprintf(files_str, sizeof(files_str), "Files: %d", file_count);
+        ssd1306_draw_string(dev, 5, 26, (const uint8_t *)files_str, 12, 1);
+
+        // Show free space in MB or GB
+        if (sd_free_bytes > 0) {
+            char free_str[32];
+            if (sd_free_bytes > 1024*1024*1024) {
+                snprintf(free_str, sizeof(free_str), "Free: %.1f GB", sd_free_bytes / (1024.0*1024.0*1024.0));
+            } else {
+                snprintf(free_str, sizeof(free_str), "Free: %.0f MB", sd_free_bytes / (1024.0*1024.0));
+            }
+            ssd1306_draw_string(dev, 5, 38, (const uint8_t *)free_str, 12, 1);
+        }
+    } else {
+        ssd1306_draw_string(dev, 5, 14, (const uint8_t *)"SD: Not mounted", 12, 1);
+    }
+
+    // Button labels
+    draw_button_labels(dev, "<", "", ">");
 }
 
 static void draw_current_screen(ssd1306_handle_t dev)
 {
     switch (current_screen) {
-        case SCREEN_TITLE:
-            draw_screen_title(dev);
-            break;
-        case SCREEN_SD_TEST:
-            draw_screen_sd_test(dev);
-            break;
         case SCREEN_RECORD:
             draw_screen_record(dev);
             break;
         case SCREEN_PLAYBACK:
             draw_screen_playback(dev);
             break;
-        case SCREEN_SETTINGS:
-            draw_screen_settings(dev);
+        case SCREEN_BLUETOOTH:
+            draw_screen_bluetooth(dev);
             break;
-        case SCREEN_GRAPHICS:
-            draw_screen_graphics(dev);
+        case SCREEN_SYSTEM:
+            draw_screen_system(dev);
             break;
-    }
-
-    // Show asterisk indicator when button 3 is toggled
-    if (invert_mode) {
-        ssd1306_draw_string(dev, 116, 0, (const uint8_t *)"*", 8, 1);
     }
 
     ssd1306_refresh_gram(dev);
@@ -484,6 +643,12 @@ void app_main(void)
     // Mount SD card
     sd_card_mount();
 
+    // Scan for existing files and get SD card info
+    if (sd_initialized) {
+        scan_sd_files();
+        get_sd_card_info();
+    }
+
     // Draw initial screen
     draw_current_screen(ssd1306_dev);
     ESP_LOGI(TAG, "Ready. Use buttons to navigate.");
@@ -492,36 +657,101 @@ void app_main(void)
     while (1) {
         bool screen_changed = false;
 
-        // Check left button (previous screen)
-        if (gpio_get_level(BTN_LEFT_GPIO) == 1 && is_debounced()) {
-            current_screen = (current_screen == 0) ? (NUM_SCREENS - 1) : (current_screen - 1);
-            screen_changed = true;
-            ESP_LOGI(TAG, "Left button pressed - Screen: %d", current_screen);
-        }
+        // Button handling - context dependent
+        if (current_screen == SCREEN_PLAYBACK && playback_browse_mode) {
+            // PLAYBACK BROWSE MODE - Different button behavior
 
-        // Check right button (next screen)
-        if (gpio_get_level(BTN_RIGHT_GPIO) == 1 && is_debounced()) {
-            current_screen = (current_screen + 1) % NUM_SCREENS;
-            screen_changed = true;
-            ESP_LOGI(TAG, "Right button pressed - Screen: %d", current_screen);
-        }
-
-        // Check middle button (toggle recording or invert)
-        if (gpio_get_level(BTN_MIDDLE_GPIO) == 1 && is_debounced()) {
-            if (current_screen == SCREEN_RECORD) {
-                // Toggle recording on record screen
-                if (is_recording) {
-                    stop_recording();
+            // LEFT button (v) - Move cursor down
+            if (gpio_get_level(BTN_LEFT_GPIO) == 1 && is_debounced()) {
+                int max_index = file_count;  // 0=Back, 1..file_count=files
+                if (selected_file_index < max_index) {
+                    selected_file_index++;
+                    // Scroll down if cursor moves past bottom of visible window
+                    if (selected_file_index >= scroll_offset + 3) {
+                        scroll_offset++;
+                    }
                 } else {
-                    start_recording();
+                    selected_file_index = 0;  // Wrap to Back
+                    scroll_offset = 0;  // Reset scroll to top
                 }
                 screen_changed = true;
-                ESP_LOGI(TAG, "Middle button - Recording: %s", is_recording ? "ON" : "OFF");
-            } else {
-                // Toggle invert on other screens
-                invert_mode = !invert_mode;
+                ESP_LOGI(TAG, "Playback cursor moved down to index %d", selected_file_index);
+            }
+
+            // RIGHT button (^) - Move cursor up
+            if (gpio_get_level(BTN_RIGHT_GPIO) == 1 && is_debounced()) {
+                if (selected_file_index > 0) {
+                    selected_file_index--;
+                    // Scroll up if cursor moves above top of visible window
+                    if (selected_file_index < scroll_offset) {
+                        scroll_offset--;
+                    }
+                } else {
+                    selected_file_index = file_count;  // Wrap to end
+                    // Scroll to show last item
+                    int total_items = file_count + 1;
+                    scroll_offset = (total_items > 3) ? (total_items - 3) : 0;
+                }
                 screen_changed = true;
-                ESP_LOGI(TAG, "Middle button - Invert: %s", invert_mode ? "ON" : "OFF");
+                ESP_LOGI(TAG, "Playback cursor moved up to index %d", selected_file_index);
+            }
+
+            // MIDDLE button (Play) - Play file or exit browse mode
+            if (gpio_get_level(BTN_MIDDLE_GPIO) == 1 && is_debounced()) {
+                if (selected_file_index == 0) {
+                    // "Back" selected - exit browse mode
+                    playback_browse_mode = false;
+                    selected_file_index = 0;
+                    scroll_offset = 0;
+                    screen_changed = true;
+                    ESP_LOGI(TAG, "Exited playback browse mode");
+                } else {
+                    // File selected - play it (Phase 4)
+                    ESP_LOGI(TAG, "Play file: %s (not yet implemented)", file_list[selected_file_index - 1]);
+                }
+            }
+        } else {
+            // NORMAL NAVIGATION MODE - Standard button behavior
+
+            // LEFT button (<) - Previous screen
+            if (gpio_get_level(BTN_LEFT_GPIO) == 1 && is_debounced()) {
+                current_screen = (current_screen == 0) ? (NUM_SCREENS - 1) : (current_screen - 1);
+                screen_changed = true;
+                ESP_LOGI(TAG, "Previous screen: %d", current_screen);
+            }
+
+            // RIGHT button (>) - Next screen
+            if (gpio_get_level(BTN_RIGHT_GPIO) == 1 && is_debounced()) {
+                current_screen = (current_screen + 1) % NUM_SCREENS;
+                screen_changed = true;
+                ESP_LOGI(TAG, "Next screen: %d", current_screen);
+            }
+
+            // MIDDLE button - Context-dependent action
+            if (gpio_get_level(BTN_MIDDLE_GPIO) == 1 && is_debounced()) {
+                if (current_screen == SCREEN_RECORD) {
+                    // Record screen: Toggle recording
+                    if (is_recording) {
+                        stop_recording();
+                        scan_sd_files();  // Refresh file list
+                        get_sd_card_info();  // Update free space
+                    } else {
+                        start_recording();
+                    }
+                    screen_changed = true;
+                    ESP_LOGI(TAG, "Recording: %s", is_recording ? "ON" : "OFF");
+                } else if (current_screen == SCREEN_PLAYBACK && file_count > 0) {
+                    // Playback screen: Enter browse mode
+                    playback_browse_mode = true;
+                    selected_file_index = 0;  // Start on "Back"
+                    scroll_offset = 0;  // Start at top
+                    screen_changed = true;
+                    ESP_LOGI(TAG, "Entered playback browse mode");
+                } else if (current_screen == SCREEN_BLUETOOTH) {
+                    // Bluetooth screen: Initiate pairing (Phase 4)
+                    ESP_LOGI(TAG, "Bluetooth pairing (not yet implemented)");
+                }
+                // SYSTEM screen: MIDDLE does nothing
             }
         }
 
@@ -537,22 +767,14 @@ void app_main(void)
                 if (written != bytes_read) {
                     ESP_LOGE(TAG, "Write failed! Stopping recording");
                     stop_recording();
-                    snprintf(sd_test_result, sizeof(sd_test_result), "Write error");
+                    scan_sd_files();
                     continue;
                 }
 
                 // Update sample count
                 recorded_samples += bytes_read / (I2S_BITS_PER_SAMPLE / 8);
 
-                // Calculate audio level (abs average)
-                int32_t sum = 0;
-                int sample_count = bytes_read / sizeof(int16_t);
-                for (int i = 0; i < sample_count; i++) {
-                    sum += abs(buffer[i]);
-                }
-                audio_level = sum / sample_count;
-
-                screen_changed = true;  // Update display with new level
+                screen_changed = true;  // Update display with elapsed time
             }
         }
 
