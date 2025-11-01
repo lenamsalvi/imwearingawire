@@ -55,7 +55,7 @@
 
 // WAV file configuration
 #define WAV_HEADER_SIZE             44
-#define RECORD_FILENAME             MOUNT_POINT "/test_rec.wav"
+#define MAX_FILENAME_LEN            64
 
 // Screen states
 #define NUM_SCREENS                 6
@@ -96,6 +96,8 @@ static bool is_recording = false;
 static FILE *recording_file = NULL;
 static uint32_t recorded_samples = 0;
 static int16_t audio_level = 0;
+static uint32_t recording_counter = 1;
+static char current_filename[MAX_FILENAME_LEN];
 
 static esp_err_t i2c_master_init(void)
 {
@@ -148,12 +150,12 @@ static void sd_card_mount(void)
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
         .format_if_mount_failed = false,
         .max_files = 5,
-        .allocation_unit_size = 16 * 1024
+        .allocation_unit_size = 0  // Use card's native cluster size
     };
 
     sdmmc_card_t *card;
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-    host.max_freq_khz = 400;  // Slow down to 400kHz for breadboard wiring
+    host.max_freq_khz = 4000;  // 4MHz - reduce if you get errors on breadboard
 
     spi_bus_config_t bus_cfg = {
         .mosi_io_num = SD_MOSI_GPIO,
@@ -184,7 +186,7 @@ static void sd_card_mount(void)
     sd_initialized = true;
 }
 
-static void write_wav_header(FILE *f, uint32_t data_size)
+static bool write_wav_header(FILE *f, uint32_t data_size)
 {
     wav_header_t header = {
         .riff = {'R', 'I', 'F', 'F'},
@@ -201,7 +203,8 @@ static void write_wav_header(FILE *f, uint32_t data_size)
         .data = {'d', 'a', 't', 'a'},
         .data_size = data_size
     };
-    fwrite(&header, sizeof(header), 1, f);
+    size_t written = fwrite(&header, sizeof(header), 1, f);
+    return (written == 1);
 }
 
 static esp_err_t i2s_init(void)
@@ -236,13 +239,8 @@ static esp_err_t i2s_init(void)
         return ret;
     }
 
-    ret = i2s_channel_enable(rx_handle);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to enable I2S channel");
-        return ret;
-    }
-
-    ESP_LOGI(TAG, "I2S microphone initialized");
+    // Don't enable yet - will enable when recording starts
+    ESP_LOGI(TAG, "I2S microphone initialized (disabled for power saving)");
     return ESP_OK;
 }
 
@@ -270,7 +268,20 @@ static void start_recording(void)
         }
     }
 
-    recording_file = fopen(RECORD_FILENAME, "wb");
+    // Enable I2S channel for recording
+    esp_err_t ret = i2s_channel_enable(rx_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to enable I2S: %s", esp_err_to_name(ret));
+        snprintf(sd_test_result, sizeof(sd_test_result), "I2S enable failed");
+        return;
+    }
+
+    // Generate unique filename
+    snprintf(current_filename, sizeof(current_filename),
+             MOUNT_POINT "/memo_%03lu.wav", recording_counter);
+    recording_counter++;
+
+    recording_file = fopen(current_filename, "wb");
     if (recording_file == NULL) {
         ESP_LOGE(TAG, "Failed to open recording file");
         snprintf(sd_test_result, sizeof(sd_test_result), "File open failed");
@@ -278,7 +289,13 @@ static void start_recording(void)
     }
 
     // Write placeholder header (will update on stop)
-    write_wav_header(recording_file, 0);
+    if (!write_wav_header(recording_file, 0)) {
+        ESP_LOGE(TAG, "Failed to write WAV header");
+        fclose(recording_file);
+        recording_file = NULL;
+        snprintf(sd_test_result, sizeof(sd_test_result), "Header write failed");
+        return;
+    }
 
     is_recording = true;
     recorded_samples = 0;
@@ -302,7 +319,13 @@ static void stop_recording(void)
     fclose(recording_file);
     recording_file = NULL;
 
-    ESP_LOGI(TAG, "Recording stopped. %lu samples recorded", recorded_samples);
+    // Disable I2S to save power
+    if (rx_handle != NULL) {
+        i2s_channel_disable(rx_handle);
+        ESP_LOGI(TAG, "I2S disabled for power saving");
+    }
+
+    ESP_LOGI(TAG, "Recording stopped. %lu samples recorded to %s", recorded_samples, current_filename);
 }
 
 static void draw_screen_title(ssd1306_handle_t dev)
@@ -343,12 +366,11 @@ static void draw_screen_record(ssd1306_handle_t dev)
         // Draw audio level meter (bar)
         int bar_width = (audio_level * 100) / 32768;  // Scale to 0-100
         if (bar_width > 100) bar_width = 100;
-        ssd1306_draw_string(dev, 5, 40, (const uint8_t *)"Level:", 8, 1);
+        ssd1306_draw_string(dev, 5, 42, (const uint8_t *)"Level:", 8, 1);
+        // Draw bar from y=52 to y=60
         for (int x = 0; x < bar_width; x++) {
             ssd1306_draw_line(dev, 5 + x, 52, 5 + x, 60);
         }
-
-        ssd1306_draw_string(dev, 10, 52, (const uint8_t *)"Press to stop", 8, 1);
     } else {
         ssd1306_draw_string(dev, 5, 8, (const uint8_t *)"RECORD READY", 16, 1);
         ssd1306_draw_string(dev, 10, 35, (const uint8_t *)"Press middle", 12, 1);
@@ -511,7 +533,13 @@ void app_main(void)
             esp_err_t ret = i2s_channel_read(rx_handle, buffer, sizeof(buffer), &bytes_read, 10);
             if (ret == ESP_OK && bytes_read > 0) {
                 // Write to file
-                fwrite(buffer, 1, bytes_read, recording_file);
+                size_t written = fwrite(buffer, 1, bytes_read, recording_file);
+                if (written != bytes_read) {
+                    ESP_LOGE(TAG, "Write failed! Stopping recording");
+                    stop_recording();
+                    snprintf(sd_test_result, sizeof(sd_test_result), "Write error");
+                    continue;
+                }
 
                 // Update sample count
                 recorded_samples += bytes_read / (I2S_BITS_PER_SAMPLE / 8);

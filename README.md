@@ -29,17 +29,17 @@ A self-reflection audio recording device built on ESP32. Records voice memos to 
 ## Pin Mappings
 
 ### ICS-43434 I2S Microphone
-- WS (Word Select): GPIO ___
-- SCK (Clock): GPIO ___
-- SD (Data): GPIO ___
+- WS (Word Select): GPIO 25
+- SCK (Clock): GPIO 26
+- SD (Data): GPIO 27
 - VCC: 3.3V
 - GND: GND
 
 ### SD Card (SPI)
-- MISO: GPIO ___
-- MOSI: GPIO ___
-- CLK: GPIO ___
-- CS: GPIO ___
+- MISO: GPIO 19
+- MOSI: GPIO 23
+- CLK: GPIO 18
+- CS: GPIO 5
 - VCC: 3.3V
 - GND: GND
 
@@ -51,9 +51,9 @@ A self-reflection audio recording device built on ESP32. Records voice memos to 
 - Address: 0 x 3D
 
 ### Buttons
-- Button 1 (Previous): GPIO 34
-- Button 2 (Next): GPIO 32
-- Button 3 (Select): GPIO 33
+- Button Left (Previous Screen): GPIO 32
+- Button Middle (Record/Select): GPIO 33
+- Button Right (Next Screen): GPIO 34
 
 ## Development Roadmap
 
@@ -67,12 +67,14 @@ A self-reflection audio recording device built on ESP32. Records voice memos to 
 ### Phase 2: Component Testing
 - [x] Wire and test OLED display (I2C communication)
 - [x] Wire and test SD card (FAT32 read/write operations)
-- [ ] Wire and test ICS-43434 microphone (I2S audio capture)
+- [x] Wire and test ICS-43434 microphone (I2S audio capture)
 - [x] Test button inputs (debouncing and event handling)
 
 ### Phase 3: Core Functionality
-- [ ] Implement WAV file recording (I2S mic → SD card)
+- [x] Implement WAV file recording (I2S mic → SD card)
+- [ ] Debug and optimize audio quality (sample rate, I2S configuration)
 - [ ] Implement file management (list, select, delete recordings)
+- [ ] Add persistent filename counter across reboots
 
 ### Phase 4: Bluetooth Audio Deep Dive
 - [ ] Implement A2DP Bluetooth playback (SD card → headphones)
@@ -107,17 +109,18 @@ A self-reflection audio recording device built on ESP32. Records voice memos to 
 
 ## Current Status
 
-**Last Updated**: 2025-10-28
+**Last Updated**: 2025-10-30
 
-**Phase**: 1 - Environment Setup
-**Current Task**: Installing ESP-IDF development environment
+**Phase**: 3 - Core Functionality (Audio Quality Debugging)
+
+**Current Task**: Diagnosing I2S audio quality issues (choppy playback, speed inconsistency)
 
 **Hardware Status**:
-- ✓ All components acquired (except battery/charging)
-- ✓ Buttons wired on breadboard
-- ✓ SD card formatted
-- ⧖ Components ready for wiring
-- ⧖ Pin mappings to be determined during testing
+- All components wired and functional on breadboard
+- I2S microphone capturing audio (quality issues under investigation)
+- SD card recording WAV files successfully
+- OLED display showing 6-screen navigation UI
+- Button-based recording control working
 
 ## Development Notes
 
@@ -127,13 +130,32 @@ A self-reflection audio recording device built on ESP32. Records voice memos to 
 - ESP-IDF required for full HFP Bluetooth stack (Arduino libraries insufficient)
 - Will test individual components before integration
 
-  **Phase 1 Completed**: 2025-10-29
+**Phase 1 Completed**: 2025-10-29
+- ESP-IDF v5.5.1 installed to `C:\esp\` (custom path to avoid spaces in Windows username)
+- CP2102 USB-to-UART drivers required manual installation from Silicon Labs
+- ESP32 board confirmed working on COM3
+- Project location: `C:\esp\projects\imwearingawire\` (avoiding user folder path issues)
+- Blink test successful - toolchain verified working
 
-  - ESP-IDF v5.5.1 installed to `C:\esp\` (custom path to avoid spaces in Windows username)
-  - CP2102 USB-to-UART drivers required manual installation from Silicon Labs
-  - ESP32 board confirmed working on COM3
-  - Project location: `C:\esp\projects\imwearingawire\` (avoiding user folder path issues)
-  - Blink test successful - toolchain verified working
+**Phase 2 Completed**: 2025-10-30
+- OLED display (SSD1306) initialized via I2C at 400kHz on GPIO 21/22
+- SD card mounted via SPI at 4MHz (initially 400kHz for breadboard stability)
+- Button debouncing implemented (200ms) with pull-down resistors
+- 6-screen navigation UI implemented (Title, SD Status, Record, Playback, Settings, Graphics)
+- I2S microphone initialized on GPIO 25/26/27 in Philips standard mode
+- Full WAV recording pipeline: I2S capture → fwrite to SD → WAV header generation
+- Real-time audio level visualization on OLED during recording
+- Automatic filename generation (memo_001.wav, memo_002.wav, etc.)
+- Power management: I2S disabled when not recording
+- Error handling added for SD card writes and WAV header generation
+
+**Code Quality Improvements** (Post-Phase 2 Review):
+- Fixed OLED display bug: removed text overlapping audio level bar
+- Fixed SD card space allocation: removed hardcoded 16KB cluster size causing mount issues
+- Added comprehensive error checking: all fwrite operations now verify bytes written
+- Increased SD SPI speed: 400kHz → 4MHz for better write performance
+- Implemented power management: I2S channel now disabled between recordings
+- Enhanced error reporting: SD operations update on-screen status messages
 
 ## Resources
 
@@ -143,15 +165,84 @@ A self-reflection audio recording device built on ESP32. Records voice memos to 
 - [Bluetooth HFP Specification](https://www.bluetooth.com/specifications/specs/hands-free-profile-1-8/)
 - [Inland Pin Map](https://community.microcenter.com/kb/articles/652-inland-esp32-core-board-black-and-eco-friendly)
 
+## Known Issues and Active Debugging
+
+### Audio Quality Issues (Current Focus)
+- **Symptom**: Recorded audio plays back choppy and speed-inconsistent
+- **Suspected causes**:
+  - I2S clock configuration mismatch with ICS-43434 expectations
+  - Sample rate mismatch between capture and WAV header
+  - Potential SD write speed issues on breadboard wiring
+  - I2S buffer configuration (1024 samples, 50ms polling may be insufficient)
+- **Investigation approach**:
+  - Verify actual sample rate of captured audio
+  - Test with MAX4466 analog microphone as baseline
+  - Measure I2S timing with logic analyzer (future)
+  - Increase I2S buffer size and reduce polling interval
+
+### Filename Persistence Issue
+- **Symptom**: Recording counter resets to memo_001.wav on every reboot
+- **Cause**: Counter stored in RAM, not persisted to storage
+- **Impact**: Each reboot overwrites previous recordings
+- **Planned fix**: Scan SD card at boot to find highest memo number + 1
+
+### SD Card Hot-Swap Issue
+- **Symptom**: Removing/reinserting SD card without reboot causes recording failure
+- **Cause**: Mount happens once at startup, `sd_initialized` flag doesn't update on card removal
+- **Impact**: Silent recording failures with no user feedback
+- **Not critical**: Device is embedded, card shouldn't be hot-swapped in normal use
+
+## Design Decisions Under Consideration
+
+### Microphone Selection
+- **Current**: ICS-43434 I2S MEMS microphone
+- **Alternative**: MAX4466 electret microphone with analog ADC input
+- **Considerations**:
+  - I2S offers higher quality ceiling but requires precise clock configuration
+  - Analog ADC is simpler, more forgiving of breadboard wiring
+  - For voice memos, analog quality may be "good enough"
+  - Decision pending audio quality debugging results
+
+### Timestamp vs Counter Filenames
+- **Current**: Sequential counter (memo_001.wav, memo_002.wav)
+- **Future Option 1**: ESP32 internal RTC (resets on power loss)
+- **Future Option 2**: External RTC module (DS3231) with battery backup
+- **Considerations**:
+  - Counter requires SD card scanning at boot for persistence
+  - Internal RTC requires initial time-setting mechanism (no WiFi in car)
+  - External RTC adds $3-5 cost and one I2C device but provides true timestamps
+  - Decision: Counter for Phase 3, consider RTC in Phase 6 (enclosure/battery)
+
+## Technical Implementation Details
+
+### Audio Recording Pipeline
+1. **I2S Configuration**: 16kHz sample rate, 16-bit mono, Philips standard mode
+2. **Capture Loop**: 50ms polling, 1024-sample buffer (64ms at 16kHz)
+3. **WAV Format**: Standard PCM WAV with 44-byte header
+4. **Storage**: Direct fwrite to SD card with error checking
+5. **Power**: I2S channel disabled between recordings
+
+### Code Architecture
+- **State Machine**: 6-screen UI with button-driven navigation
+- **Recording State**: Boolean flags with file handle management
+- **Error Handling**: All SD operations check return values and update status display
+- **Concurrency**: Single-threaded main loop, no RTOS tasks yet
+
+### Performance Characteristics
+- **SD Write Speed**: 4MHz SPI (32 KB/s theoretical, actual varies)
+- **Audio Data Rate**: 16kHz × 16-bit × 1 channel = 32 KB/s
+- **Critical timing**: Write speed must match or exceed audio data rate to avoid dropouts
+
 ## Project Structure
 
 ```
 imwearingawire/
 ├── main/                    # ESP-IDF main component (source code)
-│   ├── oled_test.c         # Current: Button + OLED navigation test
+│   ├── oled_test.c         # Main application: UI, recording, I2S, SD card
 │   ├── CMakeLists.txt      # Component build configuration
 │   └── idf_component.yml   # Component dependencies (ssd1306 driver)
 ├── build/                   # Build output (generated, not in git)
+├── sdkconfig.defaults       # ESP-IDF project configuration
 ├── CMakeLists.txt          # Root project configuration
 └── README.md               # This file
 ```
