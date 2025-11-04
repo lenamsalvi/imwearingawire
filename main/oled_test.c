@@ -92,6 +92,7 @@ typedef enum {
 typedef struct {
     esp_bd_addr_t bda;                          // Bluetooth device address
     char name[BT_DEVICE_NAME_LEN];              // Device name
+    bool is_bonded;                             // True if device is already bonded/paired
 } bt_device_t;
 
 // WAV header structure
@@ -127,10 +128,19 @@ static uint32_t recording_start_time = 0;  // For elapsed time
 
 // Playback state
 static bool playback_browse_mode = false;
+static bool playback_now_playing_mode = false;  // True when showing now playing screen
 static char file_list[MAX_FILES_IN_LIST][MAX_FILENAME_LEN];
 static int file_count = 0;
 static int selected_file_index = 0;  // 0 = "Back", 1+ = actual files
 static int scroll_offset = 0;  // Which item is at top of visible window
+
+// Audio playback state
+static bool is_playing = false;
+static FILE *playback_file = NULL;
+static char playback_filename[MAX_FILENAME_LEN];
+static uint32_t playback_sample_position = 0;
+static uint32_t playback_total_samples = 0;
+static bool playback_paused = false;
 
 // System info
 static uint64_t sd_total_bytes = 0;
@@ -155,9 +165,13 @@ static void bt_a2dp_callback(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param
 static int32_t bt_a2dp_data_callback(uint8_t *data, int32_t len);
 static void bt_avrc_ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *param);
 static void bt_avrc_tg_callback(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *param);
+static void bt_load_bonded_devices(void);
 static void bt_start_discovery(void);
 static void bt_connect_device(int device_idx);
 static void bt_disconnect(void);
+static void start_playback(const char *filename);
+static void stop_playback(void);
+static void toggle_pause(void);
 
 // Scan SD card for WAV files and update file list
 static void scan_sd_files(void)
@@ -353,6 +367,48 @@ static void bt_gap_callback(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *
     }
 }
 
+// Load bonded devices from NVS
+static void bt_load_bonded_devices(void)
+{
+    int bonded_count = esp_bt_gap_get_bond_device_num();
+    if (bonded_count == 0) {
+        ESP_LOGI(TAG, "No bonded devices found");
+        return;
+    }
+
+    ESP_LOGI(TAG, "Found %d bonded device(s)", bonded_count);
+
+    esp_bd_addr_t *bonded_list = malloc(bonded_count * sizeof(esp_bd_addr_t));
+    if (bonded_list == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate memory for bonded devices");
+        return;
+    }
+
+    int actual_count = esp_bt_gap_get_bond_device_list(&bonded_count, bonded_list);
+
+    // Add bonded devices to the list
+    for (int i = 0; i < actual_count && bt_device_count < MAX_BT_DEVICES; i++) {
+        memcpy(bt_devices[bt_device_count].bda, bonded_list[i], ESP_BD_ADDR_LEN);
+        bt_devices[bt_device_count].is_bonded = true;
+
+        // Try to get the device name from NVS
+        uint8_t *device_name = esp_bt_gap_resolve_eir_data(NULL, ESP_BT_EIR_TYPE_CMPL_LOCAL_NAME, NULL);
+        if (device_name != NULL) {
+            strncpy(bt_devices[bt_device_count].name, (char *)device_name, BT_DEVICE_NAME_LEN - 1);
+        } else {
+            snprintf(bt_devices[bt_device_count].name, BT_DEVICE_NAME_LEN, "*Bonded %d", i + 1);
+        }
+
+        // Request the actual name
+        esp_bt_gap_read_remote_name(bonded_list[i]);
+
+        ESP_LOGI(TAG, "Loaded bonded device: %s", bt_devices[bt_device_count].name);
+        bt_device_count++;
+    }
+
+    free(bonded_list);
+}
+
 // Start Bluetooth device discovery
 static void bt_start_discovery(void)
 {
@@ -364,7 +420,10 @@ static void bt_start_discovery(void)
     bt_scroll_offset = 0;
     memset(bt_devices, 0, sizeof(bt_devices));
 
-    // Start discovery (scan for 10 seconds)
+    // Load bonded devices first (they appear at top of list)
+    bt_load_bonded_devices();
+
+    // Start discovery for new devices (scan for 10 seconds)
     esp_err_t ret = esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 10, 0);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start discovery: %s", esp_err_to_name(ret));
@@ -419,15 +478,86 @@ static void bt_a2dp_callback(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param
 }
 
 // A2DP data callback - called when headphones request audio data
+// This callback provides PCM audio that ESP-IDF will encode to SBC automatically
 static int32_t bt_a2dp_data_callback(uint8_t *data, int32_t len)
 {
-    // For now, just send silence (zeros) to establish connection
-    // Later in Phase 4, we'll read from WAV file and send actual audio
     if (data == NULL || len < 0) {
         return 0;
     }
 
-    memset(data, 0, len);
+    // If not playing or paused, send silence
+    if (!is_playing || playback_paused || playback_file == NULL) {
+        memset(data, 0, len);
+        return len;
+    }
+
+    // Output format: 44.1kHz stereo 16-bit PCM
+    // len is in bytes, each stereo sample is 4 bytes (2 channels × 2 bytes)
+    int32_t output_samples = len / 4;  // Number of stereo samples
+    int16_t *output = (int16_t *)data;
+
+    // Input format: 16kHz mono 16-bit PCM
+    // Upsampling ratio: 44100 / 16000 = 2.75625
+    const float upsample_ratio = 44100.0f / 16000.0f;
+
+    #define INPUT_BUFFER_SIZE 512
+    static int16_t input_buffer[INPUT_BUFFER_SIZE];
+    static int input_buffer_count = 0;
+    static float fractional_position = 0.0f;
+
+    int output_index = 0;
+
+    while (output_index < output_samples) {
+        // Refill input buffer if needed
+        if (input_buffer_count == 0) {
+            size_t samples_read = fread(input_buffer, sizeof(int16_t), INPUT_BUFFER_SIZE, playback_file);
+            if (samples_read == 0) {
+                // End of file reached
+                ESP_LOGI(TAG, "Playback finished");
+                stop_playback();
+                // Fill rest with silence
+                while (output_index < output_samples) {
+                    output[output_index * 2] = 0;      // Left
+                    output[output_index * 2 + 1] = 0;  // Right
+                    output_index++;
+                }
+                return len;
+            }
+            input_buffer_count = samples_read;
+            playback_sample_position += samples_read;
+        }
+
+        // Calculate input index with fractional part for interpolation
+        int input_index = (int)fractional_position;
+        float frac = fractional_position - input_index;
+
+        // Get current and next sample for linear interpolation
+        int16_t sample1 = input_buffer[input_index];
+        int16_t sample2 = (input_index + 1 < input_buffer_count) ? input_buffer[input_index + 1] : sample1;
+
+        // Linear interpolation
+        int16_t interpolated = (int16_t)(sample1 + frac * (sample2 - sample1));
+
+        // Output as stereo (duplicate mono to both channels)
+        output[output_index * 2] = interpolated;      // Left
+        output[output_index * 2 + 1] = interpolated;  // Right
+
+        output_index++;
+
+        // Advance fractional position
+        fractional_position += 1.0f / upsample_ratio;
+
+        // Move to next input sample if needed
+        while (fractional_position >= 1.0f) {
+            fractional_position -= 1.0f;
+            if (input_buffer_count > 0) {
+                // Shift buffer left
+                memmove(input_buffer, input_buffer + 1, (input_buffer_count - 1) * sizeof(int16_t));
+                input_buffer_count--;
+            }
+        }
+    }
+
     return len;
 }
 
@@ -847,6 +977,100 @@ static void stop_recording(void)
     ESP_LOGI(TAG, "Recording stopped. %lu samples recorded to %s", recorded_samples, current_filename);
 }
 
+// Start playback of a WAV file
+static void start_playback(const char *filename)
+{
+    if (is_playing) {
+        ESP_LOGW(TAG, "Already playing");
+        return;
+    }
+
+    if (bt_state != BT_STATE_CONNECTED) {
+        ESP_LOGW(TAG, "Cannot play - not connected to Bluetooth device");
+        return;
+    }
+
+    // Open WAV file
+    playback_file = fopen(filename, "rb");
+    if (playback_file == NULL) {
+        ESP_LOGE(TAG, "Failed to open playback file: %s", filename);
+        return;
+    }
+
+    // Read and validate WAV header
+    wav_header_t header;
+    size_t read_size = fread(&header, 1, sizeof(header), playback_file);
+    if (read_size != sizeof(header)) {
+        ESP_LOGE(TAG, "Failed to read WAV header");
+        fclose(playback_file);
+        playback_file = NULL;
+        return;
+    }
+
+    // Validate WAV format
+    if (memcmp(header.riff, "RIFF", 4) != 0 || memcmp(header.wave, "WAVE", 4) != 0) {
+        ESP_LOGE(TAG, "Invalid WAV file format");
+        fclose(playback_file);
+        playback_file = NULL;
+        return;
+    }
+
+    // Calculate total samples
+    playback_total_samples = header.data_size / (header.bits_per_sample / 8) / header.num_channels;
+    playback_sample_position = 0;
+    playback_paused = false;
+
+    strncpy(playback_filename, filename, MAX_FILENAME_LEN - 1);
+    playback_filename[MAX_FILENAME_LEN - 1] = '\0';
+
+    is_playing = true;
+
+    // Start A2DP media streaming
+    esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
+
+    ESP_LOGI(TAG, "Playback started: %s (%lu samples, %dHz, %d channels)",
+             playback_filename, playback_total_samples, header.sample_rate, header.num_channels);
+}
+
+// Stop playback
+static void stop_playback(void)
+{
+    if (!is_playing) {
+        return;
+    }
+
+    is_playing = false;
+    playback_paused = false;
+
+    // Stop A2DP media streaming
+    esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_STOP);
+
+    if (playback_file != NULL) {
+        fclose(playback_file);
+        playback_file = NULL;
+    }
+
+    ESP_LOGI(TAG, "Playback stopped");
+}
+
+// Toggle pause/resume
+static void toggle_pause(void)
+{
+    if (!is_playing) {
+        return;
+    }
+
+    playback_paused = !playback_paused;
+
+    if (playback_paused) {
+        esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_SUSPEND);
+        ESP_LOGI(TAG, "Playback paused");
+    } else {
+        esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
+        ESP_LOGI(TAG, "Playback resumed");
+    }
+}
+
 // Screen 1: RECORD
 static void draw_screen_record(ssd1306_handle_t dev)
 {
@@ -885,12 +1109,34 @@ static void draw_screen_record(ssd1306_handle_t dev)
     }
 }
 
-// Screen 2: PLAYBACK (with two modes)
+// Screen 2: PLAYBACK (with three modes)
 static void draw_screen_playback(ssd1306_handle_t dev)
 {
     ssd1306_clear_screen(dev, 0x00);
 
-    if (!playback_browse_mode) {
+    if (is_playing) {
+        // Mode 3: Now Playing
+        ssd1306_draw_string(dev, 5, 0, (const uint8_t *)(playback_paused ? "> PAUSED" : "> PLAYING"), 12, 1);
+
+        // Filename (without path, truncated)
+        const char *name_only = strrchr(playback_filename, '/');
+        name_only = (name_only != NULL) ? name_only + 1 : playback_filename;
+        char truncated_name[20];
+        snprintf(truncated_name, sizeof(truncated_name), "%.18s", name_only);
+        ssd1306_draw_string(dev, 5, 14, (const uint8_t *)truncated_name, 12, 1);
+
+        // Time: current / total
+        uint32_t current_sec = (playback_sample_position * 10) / I2S_SAMPLE_RATE / 10;
+        uint32_t total_sec = (playback_total_samples * 10) / I2S_SAMPLE_RATE / 10;
+        char time_str[20];
+        snprintf(time_str, sizeof(time_str), "%02lu:%02lu / %02lu:%02lu",
+                 current_sec / 60, current_sec % 60,
+                 total_sec / 60, total_sec % 60);
+        ssd1306_draw_string(dev, 5, 28, (const uint8_t *)time_str, 12, 1);
+
+        // Button labels
+        draw_button_labels(dev, "", "STOP", playback_paused ? ">" : "||");
+    } else if (!playback_browse_mode) {
         // Mode 1: Screen navigation
         char title[24];
         snprintf(title, sizeof(title), ">FILES (%d)", file_count);
@@ -996,13 +1242,14 @@ static void draw_screen_bluetooth(ssd1306_handle_t dev)
                     } else {
                         // Device item
                         int device_idx = item_index - 1;  // Convert to bt_devices index
+                        char prefix = bt_devices[device_idx].is_bonded ? '*' : ' ';
                         if (is_selected) {
-                            char cursor_line[BT_DEVICE_NAME_LEN + 2];
-                            snprintf(cursor_line, sizeof(cursor_line), ">%.13s", bt_devices[device_idx].name);
+                            char cursor_line[BT_DEVICE_NAME_LEN + 3];
+                            snprintf(cursor_line, sizeof(cursor_line), ">%c%.12s", prefix, bt_devices[device_idx].name);
                             ssd1306_draw_string(dev, 5, y_pos, (const uint8_t *)cursor_line, 12, 1);
                         } else {
-                            char device_line[BT_DEVICE_NAME_LEN];
-                            snprintf(device_line, sizeof(device_line), " %.13s", bt_devices[device_idx].name);
+                            char device_line[BT_DEVICE_NAME_LEN + 2];
+                            snprintf(device_line, sizeof(device_line), " %c%.12s", prefix, bt_devices[device_idx].name);
                             ssd1306_draw_string(dev, 5, y_pos, (const uint8_t *)device_line, 12, 1);
                         }
                     }
@@ -1181,7 +1428,23 @@ void app_main(void)
         bool screen_changed = false;
 
         // Button handling - context dependent
-        if (current_screen == SCREEN_PLAYBACK && playback_browse_mode) {
+        if (current_screen == SCREEN_PLAYBACK && is_playing) {
+            // NOW PLAYING MODE - Playback controls
+
+            // MIDDLE button (STOP) - Stop playback
+            if (gpio_get_level(BTN_MIDDLE_GPIO) == 1 && is_debounced()) {
+                stop_playback();
+                playback_browse_mode = false;
+                screen_changed = true;
+                ESP_LOGI(TAG, "Playback stopped by user");
+            }
+
+            // RIGHT button (||/>)  - Pause/Resume
+            if (gpio_get_level(BTN_RIGHT_GPIO) == 1 && is_debounced()) {
+                toggle_pause();
+                screen_changed = true;
+            }
+        } else if (current_screen == SCREEN_PLAYBACK && playback_browse_mode) {
             // PLAYBACK BROWSE MODE - Different button behavior
 
             // LEFT button (v) - Move cursor down
@@ -1229,8 +1492,11 @@ void app_main(void)
                     screen_changed = true;
                     ESP_LOGI(TAG, "Exited playback browse mode");
                 } else {
-                    // File selected - play it (Phase 4)
-                    ESP_LOGI(TAG, "Play file: %s (not yet implemented)", file_list[selected_file_index - 1]);
+                    // File selected - play it!
+                    char filepath[MAX_FILENAME_LEN + 20];
+                    snprintf(filepath, sizeof(filepath), "%s/%s", MOUNT_POINT, file_list[selected_file_index - 1]);
+                    start_playback(filepath);
+                    screen_changed = true;
                 }
             }
         } else if (current_screen == SCREEN_BLUETOOTH && bt_state == BT_STATE_SCANNING && bt_device_count > 0) {
@@ -1364,6 +1630,11 @@ void app_main(void)
 
                 screen_changed = true;  // Update display with elapsed time
             }
+        }
+
+        // Update screen during playback to show progress
+        if (is_playing && current_screen == SCREEN_PLAYBACK) {
+            screen_changed = true;  // Update timer
         }
 
         // Check if Bluetooth devices were updated
