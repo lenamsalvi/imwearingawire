@@ -6,3 +6,25 @@
 # - Screen drawing: ~900 bytes peak usage
 # Setting to 6144 bytes (6KB) provides 2244 bytes safety margin (36%)
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
+
+# Bluetooth Configuration
+# Enable Bluetooth Classic for A2DP audio playback to headphones
+CONFIG_BT_ENABLED=y
+CONFIG_BT_BLUEDROID_ENABLED=y
+CONFIG_BT_CLASSIC_ENABLED=y
+CONFIG_BT_A2DP_ENABLE=y
+CONFIG_BT_A2DP_SOURCE_ENABLE=y
+CONFIG_BT_SPP_ENABLED=n
+
+# Enable AVRCP (required by most modern Bluetooth headphones)
+CONFIG_BT_AVRC_ENABLED=y
+CONFIG_BT_AVRC_TG_ENABLED=y
+CONFIG_BT_AVRC_CT_ENABLED=y
+
+# Bluetooth Controller Configuration
+CONFIG_BTDM_CTRL_MODE_BLE_ONLY=n
+CONFIG_BTDM_CTRL_MODE_BR_EDR_ONLY=y
+CONFIG_BTDM_CTRL_MODE_BTDM=n
+
+# Bluetooth memory (release BLE to save RAM)
+CONFIG_BT_BLE_ENABLED=n

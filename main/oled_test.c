@@ -15,6 +15,13 @@
 #include "driver/gpio.h"
 #include "driver/i2s_std.h"
 #include "ssd1306.h"
+#include "esp_bt.h"
+#include "esp_bt_main.h"
+#include "esp_gap_bt_api.h"
+#include "esp_bt_device.h"
+#include "esp_a2dp_api.h"
+#include "esp_avrc_api.h"
+#include "nvs_flash.h"
 
 #define TAG "NAV_TEST"
 
@@ -59,6 +66,10 @@
 #define MAX_FILENAME_LEN            64
 #define MAX_FILES_IN_LIST           20
 
+// Bluetooth configuration
+#define MAX_BT_DEVICES              10
+#define BT_DEVICE_NAME_LEN          64
+
 // Screen states
 #define NUM_SCREENS                 4
 typedef enum {
@@ -67,6 +78,21 @@ typedef enum {
     SCREEN_BLUETOOTH,
     SCREEN_SYSTEM
 } screen_state_t;
+
+// Bluetooth states
+typedef enum {
+    BT_STATE_IDLE = 0,      // Not paired, not scanning
+    BT_STATE_SCANNING,      // Discovering devices
+    BT_STATE_PAIRING,       // Attempting to pair/connect
+    BT_STATE_CONNECTED,     // Successfully connected
+    BT_STATE_DISCONNECTING  // Disconnecting from device
+} bt_state_t;
+
+// Bluetooth device info
+typedef struct {
+    esp_bd_addr_t bda;                          // Bluetooth device address
+    char name[BT_DEVICE_NAME_LEN];              // Device name
+} bt_device_t;
 
 // WAV header structure
 typedef struct {
@@ -110,10 +136,28 @@ static int scroll_offset = 0;  // Which item is at top of visible window
 static uint64_t sd_total_bytes = 0;
 static uint64_t sd_free_bytes = 0;
 
+// Bluetooth state
+static bt_state_t bt_state = BT_STATE_IDLE;
+static bt_device_t bt_devices[MAX_BT_DEVICES];
+static int bt_device_count = 0;
+static int bt_selected_device = 0;
+static int bt_scroll_offset = 0;
+static bool bt_devices_updated = false;  // Flag to trigger screen refresh
+static char bt_connected_device_name[BT_DEVICE_NAME_LEN] = {0};
+static esp_bd_addr_t bt_connected_bda = {0};  // Address of connected device
+
 // Forward declarations
 static void scan_sd_files(void);
 static void get_sd_card_info(void);
 static void draw_button_labels(ssd1306_handle_t dev, const char *left, const char *middle, const char *right);
+static void bt_gap_callback(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param);
+static void bt_a2dp_callback(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param);
+static int32_t bt_a2dp_data_callback(uint8_t *data, int32_t len);
+static void bt_avrc_ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *param);
+static void bt_avrc_tg_callback(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *param);
+static void bt_start_discovery(void);
+static void bt_connect_device(int device_idx);
+static void bt_disconnect(void);
 
 // Scan SD card for WAV files and update file list
 static void scan_sd_files(void)
@@ -207,6 +251,377 @@ static void draw_button_labels(ssd1306_handle_t dev, const char *left, const cha
     } else {
         ssd1306_draw_string(dev, 104, y_pos, (const uint8_t *)"[]", 12, 1);
     }
+}
+
+// Bluetooth GAP callback - handles device discovery events
+static void bt_gap_callback(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
+{
+    switch (event) {
+    case ESP_BT_GAP_DISC_RES_EVT:
+        // Device discovered during scan
+        if (bt_device_count >= MAX_BT_DEVICES) {
+            break;  // List full
+        }
+
+        // Check for duplicates
+        bool is_duplicate = false;
+        for (int i = 0; i < bt_device_count; i++) {
+            if (memcmp(bt_devices[i].bda, param->disc_res.bda, ESP_BD_ADDR_LEN) == 0) {
+                is_duplicate = true;
+                break;
+            }
+        }
+
+        if (is_duplicate) {
+            break;  // Already in list
+        }
+
+        ESP_LOGI(TAG, "New device discovered");
+
+        // Store device address
+        memcpy(bt_devices[bt_device_count].bda, param->disc_res.bda, ESP_BD_ADDR_LEN);
+
+        // Use placeholder until name arrives
+        snprintf(bt_devices[bt_device_count].name, BT_DEVICE_NAME_LEN, "Device %d", bt_device_count + 1);
+
+        // Request device name - will update via ESP_BT_GAP_READ_REMOTE_NAME_EVT
+        esp_bt_gap_read_remote_name(param->disc_res.bda);
+
+        ESP_LOGI(TAG, "Found device: %s (requesting name...)", bt_devices[bt_device_count].name);
+        bt_device_count++;
+        bt_devices_updated = true;  // Signal main loop to refresh screen
+        break;
+
+    case ESP_BT_GAP_DISC_STATE_CHANGED_EVT:
+        // Discovery state changed
+        if (param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STOPPED) {
+            ESP_LOGI(TAG, "Discovery stopped, found %d devices", bt_device_count);
+            if (bt_state == BT_STATE_SCANNING) {
+                // Keep in scanning state to show results
+            }
+        } else if (param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STARTED) {
+            ESP_LOGI(TAG, "Discovery started");
+        }
+        break;
+
+    case ESP_BT_GAP_READ_REMOTE_NAME_EVT:
+        // Remote device name received
+        if (param->read_rmt_name.stat == ESP_BT_STATUS_SUCCESS) {
+            // Find device in our list by address
+            for (int i = 0; i < bt_device_count; i++) {
+                if (memcmp(bt_devices[i].bda, param->read_rmt_name.bda, ESP_BD_ADDR_LEN) == 0) {
+                    // Update device name
+                    strncpy(bt_devices[i].name, (char *)param->read_rmt_name.rmt_name, BT_DEVICE_NAME_LEN - 1);
+                    bt_devices[i].name[BT_DEVICE_NAME_LEN - 1] = '\0';
+                    ESP_LOGI(TAG, "Updated device name: %s", bt_devices[i].name);
+                    bt_devices_updated = true;  // Trigger screen refresh
+                    break;
+                }
+            }
+        }
+        break;
+
+    case ESP_BT_GAP_AUTH_CMPL_EVT:
+        if (param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS) {
+            ESP_LOGI(TAG, "Authentication success with %s", param->auth_cmpl.device_name);
+        } else {
+            ESP_LOGE(TAG, "Authentication failed, status: %d", param->auth_cmpl.stat);
+        }
+        break;
+
+    case ESP_BT_GAP_PIN_REQ_EVT:
+        ESP_LOGI(TAG, "PIN request - auto accepting");
+        esp_bt_gap_pin_reply(param->pin_req.bda, true, 0, NULL);
+        break;
+
+    case ESP_BT_GAP_CFM_REQ_EVT:
+        ESP_LOGI(TAG, "SSP confirm request - auto accepting (passkey: %lu)", param->cfm_req.num_val);
+        esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, true);
+        break;
+
+    case ESP_BT_GAP_KEY_NOTIF_EVT:
+        ESP_LOGI(TAG, "SSP passkey notification: %lu", param->key_notif.passkey);
+        break;
+
+    case ESP_BT_GAP_KEY_REQ_EVT:
+        ESP_LOGI(TAG, "SSP passkey request");
+        break;
+
+    default:
+        ESP_LOGI(TAG, "GAP event: %d", event);
+        break;
+    }
+}
+
+// Start Bluetooth device discovery
+static void bt_start_discovery(void)
+{
+    ESP_LOGI(TAG, "Starting Bluetooth discovery");
+
+    // Clear previous results
+    bt_device_count = 0;
+    bt_selected_device = 0;
+    bt_scroll_offset = 0;
+    memset(bt_devices, 0, sizeof(bt_devices));
+
+    // Start discovery (scan for 10 seconds)
+    esp_err_t ret = esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 10, 0);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start discovery: %s", esp_err_to_name(ret));
+        bt_state = BT_STATE_IDLE;
+    } else {
+        bt_state = BT_STATE_SCANNING;
+    }
+}
+
+// A2DP callback - handles connection state changes (SOURCE mode)
+static void bt_a2dp_callback(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
+{
+    switch (event) {
+    case ESP_A2D_CONNECTION_STATE_EVT:
+        if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
+            ESP_LOGI(TAG, "A2DP connected successfully!");
+            bt_state = BT_STATE_CONNECTED;
+            memcpy(bt_connected_bda, param->conn_stat.remote_bda, ESP_BD_ADDR_LEN);
+            bt_devices_updated = true;
+        } else if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
+            ESP_LOGI(TAG, "A2DP disconnected");
+            bt_state = BT_STATE_IDLE;
+            memset(bt_connected_device_name, 0, sizeof(bt_connected_device_name));
+            memset(bt_connected_bda, 0, sizeof(bt_connected_bda));
+            bt_devices_updated = true;
+        } else if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTING) {
+            ESP_LOGI(TAG, "A2DP connecting...");
+        } else if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTING) {
+            ESP_LOGI(TAG, "A2DP disconnecting...");
+        }
+        break;
+
+    case ESP_A2D_AUDIO_STATE_EVT:
+        ESP_LOGI(TAG, "A2DP audio state: %d", param->audio_stat.state);
+        break;
+
+    case ESP_A2D_AUDIO_CFG_EVT:
+        ESP_LOGI(TAG, "A2DP audio config: sample_rate=%d",
+                 param->audio_cfg.mcc.type == ESP_A2D_MCT_SBC ?
+                 param->audio_cfg.mcc.cie.sbc[0] : 0);
+        break;
+
+    case ESP_A2D_MEDIA_CTRL_ACK_EVT:
+        ESP_LOGI(TAG, "A2DP media control ACK: cmd=%d, status=%d",
+                 param->media_ctrl_stat.cmd, param->media_ctrl_stat.status);
+        break;
+
+    default:
+        ESP_LOGI(TAG, "A2DP event: %d", event);
+        break;
+    }
+}
+
+// A2DP data callback - called when headphones request audio data
+static int32_t bt_a2dp_data_callback(uint8_t *data, int32_t len)
+{
+    // For now, just send silence (zeros) to establish connection
+    // Later in Phase 4, we'll read from WAV file and send actual audio
+    if (data == NULL || len < 0) {
+        return 0;
+    }
+
+    memset(data, 0, len);
+    return len;
+}
+
+// Connect to a discovered Bluetooth device
+static void bt_connect_device(int device_idx)
+{
+    if (device_idx < 0 || device_idx >= bt_device_count) {
+        ESP_LOGE(TAG, "Invalid device index: %d", device_idx);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Attempting to connect to: %s", bt_devices[device_idx].name);
+
+    // Save device name for UI display
+    strncpy(bt_connected_device_name, bt_devices[device_idx].name, BT_DEVICE_NAME_LEN - 1);
+    bt_connected_device_name[BT_DEVICE_NAME_LEN - 1] = '\0';
+
+    // Update state to show we're pairing
+    bt_state = BT_STATE_PAIRING;
+    bt_devices_updated = true;
+
+    // Connect A2DP to the device (SOURCE mode - we send audio to headphones)
+    esp_err_t ret = esp_a2d_source_connect(bt_devices[device_idx].bda);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initiate A2DP connection: %s", esp_err_to_name(ret));
+        bt_state = BT_STATE_IDLE;
+        bt_devices_updated = true;
+    }
+}
+
+// Disconnect from current Bluetooth device
+static void bt_disconnect(void)
+{
+    if (bt_state != BT_STATE_CONNECTED) {
+        ESP_LOGW(TAG, "Not connected to any device");
+        return;
+    }
+
+    ESP_LOGI(TAG, "Disconnecting from: %s", bt_connected_device_name);
+    bt_state = BT_STATE_DISCONNECTING;
+    bt_devices_updated = true;
+
+    esp_err_t ret = esp_a2d_source_disconnect(bt_connected_bda);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to disconnect: %s", esp_err_to_name(ret));
+        // Force state back to idle on error
+        bt_state = BT_STATE_IDLE;
+        memset(bt_connected_device_name, 0, sizeof(bt_connected_device_name));
+        bt_devices_updated = true;
+    }
+}
+
+// AVRCP controller callback (we are the controller, headphones are target)
+static void bt_avrc_ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *param)
+{
+    switch (event) {
+    case ESP_AVRC_CT_CONNECTION_STATE_EVT:
+        ESP_LOGI(TAG, "AVRCP CT connection state: %d", param->conn_stat.connected);
+        break;
+    case ESP_AVRC_CT_PASSTHROUGH_RSP_EVT:
+        ESP_LOGI(TAG, "AVRCP passthrough response");
+        break;
+    case ESP_AVRC_CT_METADATA_RSP_EVT:
+        ESP_LOGI(TAG, "AVRCP metadata response");
+        break;
+    default:
+        ESP_LOGI(TAG, "AVRCP CT event: %d", event);
+        break;
+    }
+}
+
+// AVRCP target callback (for remote control from headphones)
+static void bt_avrc_tg_callback(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *param)
+{
+    switch (event) {
+    case ESP_AVRC_TG_CONNECTION_STATE_EVT:
+        ESP_LOGI(TAG, "AVRCP TG connection state: %d", param->conn_stat.connected);
+        break;
+    case ESP_AVRC_TG_PASSTHROUGH_CMD_EVT:
+        ESP_LOGI(TAG, "AVRCP passthrough command: key %d, state %d",
+                 param->psth_cmd.key_code, param->psth_cmd.key_state);
+        break;
+    default:
+        ESP_LOGI(TAG, "AVRCP TG event: %d", event);
+        break;
+    }
+}
+
+// Initialize Bluetooth Classic
+static esp_err_t bt_init(void)
+{
+    ESP_LOGI(TAG, "Initializing Bluetooth");
+
+    // Release BLE memory (we only need Classic)
+    esp_err_t ret = esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "BLE memory release failed: %s", esp_err_to_name(ret));
+    }
+
+    // Initialize BT controller
+    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    ret = esp_bt_controller_init(&bt_cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "BT controller init failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    // Enable BT controller in Classic mode
+    ret = esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "BT controller enable failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    // Initialize Bluedroid stack
+    ret = esp_bluedroid_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Bluedroid init failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = esp_bluedroid_enable();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Bluedroid enable failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    // Set device name
+    esp_bt_gap_set_device_name("ImWearingAWire");
+
+    // Register GAP callback
+    ret = esp_bt_gap_register_callback(bt_gap_callback);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "GAP callback register failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    // Set discoverable and connectable mode
+    esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+
+    // Configure authentication - set to no bonding, no MITM (simpler pairing)
+    esp_bt_io_cap_t iocap = ESP_BT_IO_CAP_NONE;
+    esp_bt_gap_set_security_param(ESP_BT_SP_IOCAP_MODE, &iocap, sizeof(uint8_t));
+
+    // Enable SSP (Secure Simple Pairing)
+    esp_bt_pin_type_t pin_type = ESP_BT_PIN_TYPE_VARIABLE;
+    esp_bt_pin_code_t pin_code;
+    esp_bt_gap_set_pin(pin_type, 0, pin_code);
+
+    // Initialize AVRCP FIRST (required before A2DP)
+    // AVRCP controller (we control the headphones)
+    ret = esp_avrc_ct_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "AVRCP CT init failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = esp_avrc_ct_register_callback(bt_avrc_ct_callback);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "AVRCP CT callback register failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    // AVRCP target (headphones can send commands to us)
+    ret = esp_avrc_tg_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "AVRCP TG init failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = esp_avrc_tg_register_callback(bt_avrc_tg_callback);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "AVRCP TG callback register failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    // Initialize A2DP SOURCE AFTER AVRCP (we send audio to headphones)
+    ret = esp_a2d_register_callback(bt_a2dp_callback);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "A2DP callback register failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = esp_a2d_source_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "A2DP source init failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    // Register A2DP data callback for sending audio
+    esp_a2d_source_register_data_callback(bt_a2dp_data_callback);
+
+    ESP_LOGI(TAG, "Bluetooth initialized successfully (A2DP SOURCE mode)");
+    return ESP_OK;
 }
 
 static esp_err_t i2c_master_init(void)
@@ -534,22 +949,115 @@ static void draw_screen_playback(ssd1306_handle_t dev)
     }
 }
 
-// Screen 3: BLUETOOTH (placeholder for Phase 4)
+// Screen 3: BLUETOOTH (Phase 4 - Dynamic UI)
 static void draw_screen_bluetooth(ssd1306_handle_t dev)
 {
     ssd1306_clear_screen(dev, 0x00);
 
-    // Title
-    ssd1306_draw_string(dev, 10, 0, (const uint8_t *)"BLUETOOTH", 12, 1);
+    switch (bt_state) {
+        case BT_STATE_IDLE:
+            // Not paired, not scanning
+            ssd1306_draw_string(dev, 10, 0, (const uint8_t *)"BLUETOOTH", 12, 1);
+            ssd1306_draw_string(dev, 5, 16, (const uint8_t *)"Not paired", 12, 1);
+            draw_button_labels(dev, "<", "PAIR", ">");
+            break;
 
-    // Status
-    ssd1306_draw_string(dev, 5, 16, (const uint8_t *)"Not paired", 12, 1);
+        case BT_STATE_SCANNING:
+            // Discovering devices - show scrolling list
+            if (bt_device_count == 0) {
+                // Still scanning, no devices yet
+                ssd1306_draw_string(dev, 5, 0, (const uint8_t *)"BLUETOOTH", 12, 1);
+                ssd1306_draw_string(dev, 5, 16, (const uint8_t *)"Scanning...", 12, 1);
+                draw_button_labels(dev, "<", "", ">");
+            } else {
+                // Show device list with scrolling (including "Cancel" option)
+                char title[24];
+                snprintf(title, sizeof(title), "BT (%d found)", bt_device_count);
+                ssd1306_draw_string(dev, 5, 0, (const uint8_t *)title, 12, 1);
 
-    // Note
-    ssd1306_draw_string(dev, 5, 28, (const uint8_t *)"(Phase 4)", 12, 1);
+                // Show 3 items at a time
+                // Item 0 = "Cancel", Items 1+ = devices
+                int total_items = bt_device_count + 1;  // +1 for "Cancel"
 
-    // Button labels
-    draw_button_labels(dev, "<", "PAIR", ">");
+                for (int i = 0; i < 3; i++) {
+                    int item_index = bt_scroll_offset + i;
+                    if (item_index >= total_items) break;  // No more items
+
+                    int y_pos = 14 + (i * 12);
+                    bool is_selected = (item_index == bt_selected_device);
+
+                    if (item_index == 0) {
+                        // "Cancel" option
+                        if (is_selected) {
+                            ssd1306_draw_string(dev, 5, y_pos, (const uint8_t *)">Cancel", 12, 1);
+                        } else {
+                            ssd1306_draw_string(dev, 8, y_pos, (const uint8_t *)"Cancel", 12, 1);
+                        }
+                    } else {
+                        // Device item
+                        int device_idx = item_index - 1;  // Convert to bt_devices index
+                        if (is_selected) {
+                            char cursor_line[BT_DEVICE_NAME_LEN + 2];
+                            snprintf(cursor_line, sizeof(cursor_line), ">%.13s", bt_devices[device_idx].name);
+                            ssd1306_draw_string(dev, 5, y_pos, (const uint8_t *)cursor_line, 12, 1);
+                        } else {
+                            char device_line[BT_DEVICE_NAME_LEN];
+                            snprintf(device_line, sizeof(device_line), " %.13s", bt_devices[device_idx].name);
+                            ssd1306_draw_string(dev, 5, y_pos, (const uint8_t *)device_line, 12, 1);
+                        }
+                    }
+                }
+
+                // Button labels
+                draw_button_labels(dev, "v", "Select", "^");
+            }
+            break;
+
+        case BT_STATE_PAIRING:
+            // Attempting to pair with device
+            ssd1306_draw_string(dev, 10, 0, (const uint8_t *)"BLUETOOTH", 12, 1);
+            ssd1306_draw_string(dev, 5, 16, (const uint8_t *)"Connecting...", 12, 1);
+
+            // Show device name being paired
+            if (strlen(bt_connected_device_name) > 0) {
+                char device_name[BT_DEVICE_NAME_LEN];
+                snprintf(device_name, sizeof(device_name), "%.16s", bt_connected_device_name);
+                ssd1306_draw_string(dev, 5, 28, (const uint8_t *)device_name, 12, 1);
+            }
+
+            draw_button_labels(dev, "", "", "");
+            break;
+
+        case BT_STATE_CONNECTED:
+            // Successfully connected to device
+            ssd1306_draw_string(dev, 10, 0, (const uint8_t *)"BLUETOOTH", 12, 1);
+            ssd1306_draw_string(dev, 5, 16, (const uint8_t *)"CONNECTED", 12, 1);
+
+            // Show connected device name
+            if (strlen(bt_connected_device_name) > 0) {
+                char device_name[BT_DEVICE_NAME_LEN];
+                snprintf(device_name, sizeof(device_name), "%.16s", bt_connected_device_name);
+                ssd1306_draw_string(dev, 5, 28, (const uint8_t *)device_name, 12, 1);
+            }
+
+            draw_button_labels(dev, "<", "DISC", ">");
+            break;
+
+        case BT_STATE_DISCONNECTING:
+            // Disconnecting from device
+            ssd1306_draw_string(dev, 10, 0, (const uint8_t *)"BLUETOOTH", 12, 1);
+            ssd1306_draw_string(dev, 5, 16, (const uint8_t *)"Disconnecting...", 12, 1);
+
+            // Show device name being disconnected
+            if (strlen(bt_connected_device_name) > 0) {
+                char device_name[BT_DEVICE_NAME_LEN];
+                snprintf(device_name, sizeof(device_name), "%.16s", bt_connected_device_name);
+                ssd1306_draw_string(dev, 5, 28, (const uint8_t *)device_name, 12, 1);
+            }
+
+            draw_button_labels(dev, "", "", "");
+            break;
+    }
 }
 
 // Screen 4: SYSTEM
@@ -612,9 +1120,18 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "Starting button + display navigation test");
 
+    // Initialize NVS (required for Bluetooth)
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+    ESP_LOGI(TAG, "NVS initialized");
+
     // Initialize I2C
     ESP_LOGI(TAG, "Initializing I2C on SDA=%d, SCL=%d", I2C_MASTER_SDA_IO, I2C_MASTER_SCL_IO);
-    esp_err_t ret = i2c_master_init();
+    ret = i2c_master_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "I2C initialization failed: %s", esp_err_to_name(ret));
         return;
@@ -647,6 +1164,12 @@ void app_main(void)
     if (sd_initialized) {
         scan_sd_files();
         get_sd_card_info();
+    }
+
+    // Initialize Bluetooth
+    ret = bt_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Bluetooth initialization failed");
     }
 
     // Draw initial screen
@@ -710,6 +1233,62 @@ void app_main(void)
                     ESP_LOGI(TAG, "Play file: %s (not yet implemented)", file_list[selected_file_index - 1]);
                 }
             }
+        } else if (current_screen == SCREEN_BLUETOOTH && bt_state == BT_STATE_SCANNING && bt_device_count > 0) {
+            // BLUETOOTH SCANNING MODE - Device selection
+            // Items: 0="Cancel", 1..N=devices
+
+            // LEFT button (v) - Move cursor down
+            if (gpio_get_level(BTN_LEFT_GPIO) == 1 && is_debounced()) {
+                int max_index = bt_device_count;  // 0=Cancel, 1..device_count=devices
+                if (bt_selected_device < max_index) {
+                    bt_selected_device++;
+                    // Scroll down if cursor moves past bottom of visible window
+                    if (bt_selected_device >= bt_scroll_offset + 3) {
+                        bt_scroll_offset++;
+                    }
+                } else {
+                    bt_selected_device = 0;  // Wrap to Cancel
+                    bt_scroll_offset = 0;  // Reset scroll to top
+                }
+                screen_changed = true;
+                ESP_LOGI(TAG, "BT cursor moved down to index %d", bt_selected_device);
+            }
+
+            // RIGHT button (^) - Move cursor up
+            if (gpio_get_level(BTN_RIGHT_GPIO) == 1 && is_debounced()) {
+                if (bt_selected_device > 0) {
+                    bt_selected_device--;
+                    // Scroll up if cursor moves above top of visible window
+                    if (bt_selected_device < bt_scroll_offset) {
+                        bt_scroll_offset--;
+                    }
+                } else {
+                    bt_selected_device = bt_device_count;  // Wrap to last device
+                    // Scroll to show last item
+                    int total_items = bt_device_count + 1;
+                    bt_scroll_offset = (total_items > 3) ? (total_items - 3) : 0;
+                }
+                screen_changed = true;
+                ESP_LOGI(TAG, "BT cursor moved up to index %d", bt_selected_device);
+            }
+
+            // MIDDLE button (Select) - Select device or cancel
+            if (gpio_get_level(BTN_MIDDLE_GPIO) == 1 && is_debounced()) {
+                if (bt_selected_device == 0) {
+                    // "Cancel" selected - return to IDLE
+                    bt_state = BT_STATE_IDLE;
+                    bt_device_count = 0;
+                    bt_selected_device = 0;
+                    bt_scroll_offset = 0;
+                    screen_changed = true;
+                    ESP_LOGI(TAG, "Bluetooth scan cancelled, returning to IDLE");
+                } else {
+                    // Device selected - connect to it
+                    int device_idx = bt_selected_device - 1;  // Convert to device array index
+                    bt_connect_device(device_idx);
+                    screen_changed = true;
+                }
+            }
         } else {
             // NORMAL NAVIGATION MODE - Standard button behavior
 
@@ -748,8 +1327,17 @@ void app_main(void)
                     screen_changed = true;
                     ESP_LOGI(TAG, "Entered playback browse mode");
                 } else if (current_screen == SCREEN_BLUETOOTH) {
-                    // Bluetooth screen: Initiate pairing (Phase 4)
-                    ESP_LOGI(TAG, "Bluetooth pairing (not yet implemented)");
+                    // Bluetooth screen: State-dependent actions
+                    if (bt_state == BT_STATE_IDLE) {
+                        // Start discovery
+                        bt_start_discovery();
+                        screen_changed = true;
+                        ESP_LOGI(TAG, "Starting Bluetooth scan");
+                    } else if (bt_state == BT_STATE_CONNECTED) {
+                        // Disconnect from device
+                        bt_disconnect();
+                        screen_changed = true;
+                    }
                 }
                 // SYSTEM screen: MIDDLE does nothing
             }
@@ -776,6 +1364,12 @@ void app_main(void)
 
                 screen_changed = true;  // Update display with elapsed time
             }
+        }
+
+        // Check if Bluetooth devices were updated
+        if (bt_devices_updated) {
+            bt_devices_updated = false;
+            screen_changed = true;
         }
 
         // Redraw screen if changed
